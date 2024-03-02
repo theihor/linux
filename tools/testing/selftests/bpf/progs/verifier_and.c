@@ -21,7 +21,7 @@ struct {
 
 SEC("socket")
 __description("invalid and of negative number")
-__failure __msg("R0 max value is outside of the allowed memory range")
+__failure __msg_re("R[0-9] max value is outside of the allowed memory range")
 __failure_unpriv
 __flag(BPF_F_ANY_ALIGNMENT)
 __naked void invalid_and_of_negative_number(void)

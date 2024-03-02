@@ -8,6 +8,7 @@
 #include "autoconf_helper.h"
 #include "unpriv_helpers.h"
 #include "cap_helpers.h"
+#include "regex_helpers.h"
 
 #define str_has_pfx(str, pfx) \
 	(strncmp(str, pfx, __builtin_constant_p(pfx) ? sizeof(pfx) - 1 : strlen(pfx)) == 0)
@@ -17,9 +18,11 @@
 #define TEST_TAG_EXPECT_FAILURE "comment:test_expect_failure"
 #define TEST_TAG_EXPECT_SUCCESS "comment:test_expect_success"
 #define TEST_TAG_EXPECT_MSG_PFX "comment:test_expect_msg="
+#define TEST_TAG_EXPECT_MSG_RE_PFX "comment:test_expect_msg_re="
 #define TEST_TAG_EXPECT_FAILURE_UNPRIV "comment:test_expect_failure_unpriv"
 #define TEST_TAG_EXPECT_SUCCESS_UNPRIV "comment:test_expect_success_unpriv"
 #define TEST_TAG_EXPECT_MSG_PFX_UNPRIV "comment:test_expect_msg_unpriv="
+#define TEST_TAG_EXPECT_MSG_RE_PFX_UNPRIV "comment:test_expect_msg_re_unpriv="
 #define TEST_TAG_LOG_LEVEL_PFX "comment:test_log_level="
 #define TEST_TAG_PROG_FLAGS_PFX "comment:test_prog_flags="
 #define TEST_TAG_DESCRIPTION_PFX "comment:test_description="
@@ -46,10 +49,15 @@ enum mode {
 	UNPRIV = 2
 };
 
+struct expect_msg {
+	const char* msg;
+	bool regex;
+};
+
 struct test_subspec {
 	char *name;
 	bool expect_failure;
-	const char **expect_msgs;
+	struct expect_msg *expect_msgs;
 	size_t expect_msg_cnt;
 	int retval;
 	bool execute;
@@ -100,20 +108,25 @@ static void free_test_spec(struct test_spec *spec)
 	spec->unpriv.expect_msgs = NULL;
 }
 
-static int push_msg(const char *msg, struct test_subspec *subspec)
+static int push_msg(const char *msg, struct test_subspec *subspec, bool regex)
 {
-	void *tmp;
+	size_t n = 1 + subspec->expect_msg_cnt;
+	struct expect_msg *tmp;
 
-	tmp = realloc(subspec->expect_msgs, (1 + subspec->expect_msg_cnt) * sizeof(void *));
+	tmp = realloc(subspec->expect_msgs, n * sizeof(*tmp));
 	if (!tmp) {
 		ASSERT_FAIL("failed to realloc memory for messages\n");
 		return -ENOMEM;
 	}
 	subspec->expect_msgs = tmp;
-	subspec->expect_msgs[subspec->expect_msg_cnt++] = msg;
+
+	subspec->expect_msgs[n-1].msg = msg;
+	subspec->expect_msgs[n-1].regex = regex;
+	subspec->expect_msg_cnt = n;
 
 	return 0;
 }
+
 
 static int parse_int(const char *str, int *val, const char *name)
 {
@@ -233,13 +246,25 @@ static int parse_test_spec(struct test_loader *tester,
 			spec->mode_mask |= UNPRIV;
 		} else if (str_has_pfx(s, TEST_TAG_EXPECT_MSG_PFX)) {
 			msg = s + sizeof(TEST_TAG_EXPECT_MSG_PFX) - 1;
-			err = push_msg(msg, &spec->priv);
+			err = push_msg(msg, &spec->priv, false);
+			if (err)
+				goto cleanup;
+			spec->mode_mask |= PRIV;
+		} else if (str_has_pfx(s, TEST_TAG_EXPECT_MSG_RE_PFX)) {
+			msg = s + sizeof(TEST_TAG_EXPECT_MSG_RE_PFX) - 1;
+			err = push_msg(msg, &spec->priv, true);
 			if (err)
 				goto cleanup;
 			spec->mode_mask |= PRIV;
 		} else if (str_has_pfx(s, TEST_TAG_EXPECT_MSG_PFX_UNPRIV)) {
 			msg = s + sizeof(TEST_TAG_EXPECT_MSG_PFX_UNPRIV) - 1;
-			err = push_msg(msg, &spec->unpriv);
+			err = push_msg(msg, &spec->unpriv, false);
+			if (err)
+				goto cleanup;
+			spec->mode_mask |= UNPRIV;
+		} else if (str_has_pfx(s, TEST_TAG_EXPECT_MSG_RE_PFX_UNPRIV)) {
+			msg = s + sizeof(TEST_TAG_EXPECT_MSG_RE_PFX_UNPRIV) - 1;
+			err = push_msg(msg, &spec->unpriv, true);
 			if (err)
 				goto cleanup;
 			spec->mode_mask |= UNPRIV;
@@ -386,7 +411,6 @@ static void prepare_case(struct test_loader *tester,
 	bpf_program__set_flags(prog, prog_flags | spec->prog_flags);
 
 	tester->log_buf[0] = '\0';
-	tester->next_match_pos = 0;
 }
 
 static void emit_verifier_log(const char *log_buf, bool force)
@@ -397,32 +421,40 @@ static void emit_verifier_log(const char *log_buf, bool force)
 }
 
 static void validate_case(struct test_loader *tester,
-			  struct test_subspec *subspec,
-			  struct bpf_object *obj,
-			  struct bpf_program *prog,
-			  int load_err)
+			  struct test_subspec *subspec)
 {
+	char *next_match = tester->log_buf;
+	regmatch_t re_match;
+	u32 match_len;
 	int i, j;
+	bool ok;
 
 	for (i = 0; i < subspec->expect_msg_cnt; i++) {
-		char *match;
-		const char *expect_msg;
+		const char *expect_msg = subspec->expect_msgs[i].msg;
+		ok = false;
+		match_len = 0;
 
-		expect_msg = subspec->expect_msgs[i];
+		if (subspec->expect_msgs[i].regex) {
+			ok = !match_regex(expect_msg, next_match, &re_match);
+			match_len = re_match.rm_eo;
+		} else {
+			ok = !!strstr(next_match, expect_msg);
+			match_len = strlen(expect_msg);
+		}
 
-		match = strstr(tester->log_buf + tester->next_match_pos, expect_msg);
-		if (!ASSERT_OK_PTR(match, "expect_msg")) {
+		if (!ASSERT_TRUE(ok, "expect_msg")) {
 			/* if we are in verbose mode, we've already emitted log */
 			if (env.verbosity == VERBOSE_NONE)
 				emit_verifier_log(tester->log_buf, true /*force*/);
 			for (j = 0; j < i; j++)
 				fprintf(stderr,
-					"MATCHED  MSG: '%s'\n", subspec->expect_msgs[j]);
+					"MATCHED  MSG: '%s'\n",
+					subspec->expect_msgs[j].msg);
 			fprintf(stderr, "EXPECTED MSG: '%s'\n", expect_msg);
 			return;
 		}
 
-		tester->next_match_pos = match - tester->log_buf + strlen(expect_msg);
+		next_match += match_len;
 	}
 }
 
@@ -632,7 +664,7 @@ void run_subtest(struct test_loader *tester,
 	}
 
 	emit_verifier_log(tester->log_buf, false /*force*/);
-	validate_case(tester, subspec, tobj, tprog, err);
+	validate_case(tester, subspec);
 
 	if (should_do_test_run(spec, subspec)) {
 		/* For some reason test_verifier executes programs
