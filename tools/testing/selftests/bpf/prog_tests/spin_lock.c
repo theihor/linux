@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <regex.h>
 #include <test_progs.h>
 #include <network_helpers.h>
+#include <regex_helpers.h>
 
 #include "test_spin_lock.skel.h"
 #include "test_spin_lock_fail.skel.h"
@@ -52,24 +52,6 @@ static struct {
 	{ "lock_global_subprog_call2", "global function calls are not allowed while holding a lock" },
 };
 
-static int match_regex(const char *pattern, const char *string)
-{
-	int err, rc;
-	regex_t re;
-
-	err = regcomp(&re, pattern, REG_NOSUB);
-	if (err) {
-		char errbuf[512];
-
-		regerror(err, &re, errbuf, sizeof(errbuf));
-		PRINT_FAIL("Can't compile regex: %s\n", errbuf);
-		return -1;
-	}
-	rc = regexec(&re, string, 0, NULL, 0);
-	regfree(&re);
-	return rc == 0 ? 1 : 0;
-}
-
 static void test_spin_lock_fail_prog(const char *prog_name, const char *err_msg)
 {
 	LIBBPF_OPTS(bpf_object_open_opts, opts, .kernel_log_buf = log_buf,
@@ -99,11 +81,8 @@ static void test_spin_lock_fail_prog(const char *prog_name, const char *err_msg)
 		goto end;
 	}
 
-	ret = match_regex(err_msg, log_buf);
-	if (!ASSERT_GE(ret, 0, "match_regex"))
-		goto end;
-
-	if (!ASSERT_TRUE(ret, "no match for expected error message")) {
+	ret = match_regex(err_msg, log_buf, NULL);
+	if (!ASSERT_EQ(ret, 0, "no match for expected error message")) {
 		fprintf(stderr, "Expected: %s\n", err_msg);
 		fprintf(stderr, "Verifier: %s\n", log_buf);
 	}

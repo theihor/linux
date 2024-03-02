@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <regex.h>
+#include <regex_helpers.h>
 #include <test_progs.h>
 
 #include "bpf/btf.h"
@@ -207,8 +207,8 @@ static struct test_case test_cases[] = {
 
 #undef N
 
-static regex_t *ident_regex;
-static regex_t *field_regex;
+static regex_t ident_regex;
+static regex_t field_regex;
 
 static char *skip_space(char *str)
 {
@@ -320,39 +320,6 @@ static int find_field_offset(struct btf *btf, char *pattern, regmatch_t *matches
 	}
 
 	return field_offset;
-}
-
-static regex_t *compile_regex(char *pat)
-{
-	regex_t *re;
-	int err;
-
-	re = malloc(sizeof(regex_t));
-	if (!re) {
-		PRINT_FAIL("Can't alloc regex\n");
-		return NULL;
-	}
-
-	err = regcomp(re, pat, REG_EXTENDED);
-	if (err) {
-		char errbuf[512];
-
-		regerror(err, re, errbuf, sizeof(errbuf));
-		PRINT_FAIL("Can't compile regex: %s\n", errbuf);
-		free(re);
-		return NULL;
-	}
-
-	return re;
-}
-
-static void free_regex(regex_t *re)
-{
-	if (!re)
-		return;
-
-	regfree(re);
-	free(re);
 }
 
 static u32 max_line_len(char *str)
@@ -550,7 +517,7 @@ _continue:
 				}
 
 				printf("pattern: %s\n", pattern);
-				if (regexec(field_regex, pattern, 3, matches, 0) != 0) {
+				if (regexec(&field_regex, pattern, 3, matches, 0) != 0) {
 					PRINT_FAIL("Field reference expected\n");
 					goto err;
 				}
@@ -577,7 +544,7 @@ _continue:
 		/* Match field reference:
 		 *   sk_buff::cb
 		 */
-		if (regexec(field_regex, pattern, 3, matches, 0) == 0) {
+		if (regexec(&field_regex, pattern, 3, matches, 0) == 0) {
 			int field_offset;
 			char *text_next;
 
@@ -601,7 +568,7 @@ _continue:
 		 * skip the identifier to avoid n^2 application of the
 		 * field reference rule.
 		 */
-		if (regexec(ident_regex, pattern, 1, matches, 0) == 0) {
+		if (regexec(&ident_regex, pattern, 1, matches, 0) == 0) {
 			if (strncmp(pattern, text, matches[0].rm_eo) != 0)
 				goto err;
 
@@ -850,11 +817,16 @@ static void run_one_testcase(struct btf *btf, struct test_case *test)
 void test_ctx_rewrite(void)
 {
 	struct btf *btf;
-	int i;
+	int i, err;
 
-	field_regex = compile_regex("^([[:alpha:]_][[:alnum:]_]+)::([[:alpha:]_][[:alnum:]_]+)");
-	ident_regex = compile_regex("^[[:alpha:]_][[:alnum:]_]+");
-	if (!field_regex || !ident_regex)
+	err = compile_regex("^([[:alpha:]_][[:alnum:]_]+)::([[:alpha:]_][[:alnum:]_]+)",
+			    REG_EXTENDED,
+			    &field_regex);
+	if (err)
+		return;
+
+	err = compile_regex("^[[:alpha:]_][[:alnum:]_]+", REG_EXTENDED, &ident_regex);
+	if (err)
 		return;
 
 	btf = btf__load_vmlinux_btf();
@@ -868,6 +840,6 @@ void test_ctx_rewrite(void)
 
 out:
 	btf__free(btf);
-	free_regex(field_regex);
-	free_regex(ident_regex);
+	regfree(&field_regex);
+	regfree(&ident_regex);
 }
